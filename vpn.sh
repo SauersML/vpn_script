@@ -24,7 +24,6 @@ get_vpnc_script() {
   if [ "$OS" = "Darwin" ]; then
     # --- MACOS DETECTED ---
     # On macOS, we use the standard vpnc-script installed by Homebrew/MacPorts.
-    # The custom Linux logic (ip route) will not work here.
     local mac_paths=(
       "/opt/homebrew/etc/vpnc-script"
       "/usr/local/etc/vpnc-script"
@@ -39,33 +38,26 @@ get_vpnc_script() {
     done
 
     echo "ERROR: standard 'vpnc-script' not found." >&2
-    echo "       If you installed via Homebrew, run: brew install vpnc-scripts" >&2
+    echo "       Run: brew install vpnc-scripts" >&2
     exit 1
 
   else
     # --- LINUX DETECTED ---
-    # Use the custom inline script provided in the original code
+    # Use the custom inline script logic
     local s; s="$(mktemp -p /tmp umn_vpnc.XXXXXX.sh)"
     cat >"$s" <<'EOS'
 #!/usr/bin/env bash
-
 set -Eeuo pipefail
 PATH=/usr/sbin:/sbin:/usr/bin:/bin
-
 STATE_DIR="/run/umn-openconnect"
 mkdir -p "$STATE_DIR"
-
 VPNPID="${VPNPID:-$PPID}"
 DEFROUTE="$STATE_DIR/defroute.$VPNPID"
 ROUTES_INC="$STATE_DIR/routes-inc.$VPNPID"
 ROUTES_EXC="$STATE_DIR/routes-exc.$VPNPID"
 RESOLV_BAK="$STATE_DIR/resolv.$VPNPID"
-
 ip4() { ip -4 "$@"; }
-
-# --- routing helpers ----------------------------------------------------------
 host_route_add() {
-  # Ensure a direct (non-tunnel) route to the VPN gateway to avoid loops
   local line dev via
   line="$(ip4 route get "$VPNGATEWAY" 2>/dev/null | head -n1 || true)"
   dev="$(awk '/ dev /{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1);exit}}' <<<"$line")"
@@ -76,7 +68,6 @@ host_route_add() {
   fi
 }
 host_route_del() { ip4 route del "$VPNGATEWAY" 2>/dev/null || true; }
-
 tun_up() {
   local mtu="${INTERNAL_IP4_MTU:-}"
   if [ -z "$mtu" ]; then
@@ -87,17 +78,13 @@ tun_up() {
   ip link set dev "$TUNDEV" up mtu "$mtu"
   ip4 addr add "$INTERNAL_IP4_ADDRESS/32" peer "$INTERNAL_IP4_ADDRESS" dev "$TUNDEV" 2>/dev/null || true
 }
-
 tun_down() {
   ip4 addr del "$INTERNAL_IP4_ADDRESS/32" dev "$TUNDEV" 2>/dev/null || true
   ip link set dev "$TUNDEV" down 2>/dev/null || true
 }
-
 routes_apply() {
   : >"$ROUTES_INC"; : >"$ROUTES_EXC"
   ip4 route show default >"$DEFROUTE" 2>/dev/null || true
-
-  # Split excludes (keep these OUT of tunnel): best-effort via current uplink
   local exc_n="${CISCO_SPLIT_EXC:-0}"
   if [ "$exc_n" -gt 0 ]; then
     local dev via line net len
@@ -119,8 +106,6 @@ routes_apply() {
       fi
     done
   fi
-
-  # Split includes (send these VIA tunnel). If none, default all via tunnel.
   local inc_n="${CISCO_SPLIT_INC:-0}" net len
   if [ "$inc_n" -gt 0 ]; then
     for ((i=0;i<inc_n;i++)); do
@@ -137,19 +122,15 @@ routes_apply() {
     ip4 route replace default dev "$TUNDEV" metric 1
   fi
 }
-
 routes_revert() {
-  # Remove includes
   if [ -s "$ROUTES_INC" ]; then
     while read -r pfx; do ip4 route del "$pfx" dev "$TUNDEV" 2>/dev/null || true; done <"$ROUTES_INC"
     rm -f "$ROUTES_INC"
   fi
-  # Remove excludes
   if [ -s "$ROUTES_EXC" ]; then
     while read -r line; do ip4 route del $line 2>/dev/null || true; done <"$ROUTES_EXC"
     rm -f "$ROUTES_EXC"
   fi
-  # Restore defaults
   if [ -s "$DEFROUTE" ]; then
     while read -r line; do ip4 route replace $line || true; done <"$DEFROUTE"
     rm -f "$DEFROUTE"
@@ -157,8 +138,6 @@ routes_revert() {
     ip4 route del default dev "$TUNDEV" 2>/dev/null || true
   fi
 }
-
-# --- DNS helpers -------------------------------------------------------------
 dns_set() {
   [ -n "${INTERNAL_IP4_DNS:-}" ] || return 0
   if command -v resolvectl >/dev/null 2>&1 && readlink -f /etc/resolv.conf 2>/dev/null | grep -q '/run/systemd/resolve'; then
@@ -178,7 +157,6 @@ dns_set() {
     } >/etc/resolv.conf
   fi
 }
-
 dns_unset() {
   if command -v resolvectl >/dev/null 2>&1 && readlink -f /etc/resolv.conf 2>/dev/null | grep -q '/run/systemd/resolve'; then
     resolvectl revert "$TUNDEV" 2>/dev/null || true
@@ -189,25 +167,14 @@ dns_unset() {
     rm -f "$RESOLV_BAK"
   fi
 }
-
-# --- event switch ------------------------------------------------------------
 case "${reason:-}" in
   pre-init) : ;;
   connect)
-    host_route_add
-    tun_up
-    routes_apply
-    dns_set
-    ;;
+    host_route_add; tun_up; routes_apply; dns_set ;;
   disconnect)
-    dns_unset
-    routes_revert
-    host_route_del
-    tun_down
-    ;;
+    dns_unset; routes_revert; host_route_del; tun_down ;;
   attempt-reconnect)
-    host_route_add
-    ;;
+    host_route_add ;;
   *) : ;;
 esac
 exit 0
@@ -217,10 +184,13 @@ EOS
   fi
 }
 
-# Get the script path (either generated temp file or system path)
-INLINE_SCRIPT="$(get_vpnc_script)"
+# --- TTY Setup ---------------------------------------------------------------
+if [ ! -t 0 ] && [ -r /dev/tty ]; then
+  exec </dev/tty
+fi
 
-# Only delete the script on exit if we are on Linux (where we created a temp file)
+# --- Get Script & Cleanup Setup ----------------------------------------------
+INLINE_SCRIPT="$(get_vpnc_script)"
 cleanup() { 
   if [ "$OS" = "Linux" ] && [ -n "${INLINE_SCRIPT:-}" ]; then 
     rm -f "$INLINE_SCRIPT"
@@ -228,34 +198,25 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# --- TTY-robust prompts (avoid hangs) ----------------------------------------
-# Always read secrets from the terminal device to guarantee a visible prompt.
-if [ ! -t 0 ] && [ -r /dev/tty ]; then
-  exec </dev/tty
-fi
-
-echo "Attempting to connect to UMN VPN (${VPN_GROUP}) as ${VPN_USER} on ${OS}..."
-printf "Enter UMN Password (ONLY the password; Duo factor '%s' will be appended): " "$DUO_FACTOR"
+# --- Credentials -------------------------------------------------------------
+echo "Attempting to connect to UMN VPN (${VPN_GROUP}) on ${OS}..."
+printf "Enter UMN Password (ONLY the password; Duo '%s' is auto-appended): " "$DUO_FACTOR"
 IFS= read -r -s UMN_PASSWORD
 echo
 [ -z "${UMN_PASSWORD:-}" ] && { echo "No password entered. Aborting."; exit 1; }
 PASSWD_WITH_DUO="${UMN_PASSWORD},${DUO_FACTOR}"
 unset UMN_PASSWORD
 
-# Make sudo ask NOW (on the terminal), then never prompt again mid-connection.
-echo "Escalating privileges to configure routes/DNS (sudo)..."
+echo "Escalating privileges (sudo)..."
 if ! sudo -nv true 2>/dev/null; then
   sudo -k
-  # Force the prompt to /dev/tty so it can't be swallowed by any pipes.
-  sudo -v -p "[sudo] password: " </dev/tty 1>/dev/tty 2>/dev/tty || { echo "sudo authentication failed."; exit 1; }
+  sudo -v -p "[sudo] password: " </dev/tty 1>/dev/tty 2>/dev/tty || { echo "sudo failed."; exit 1; }
 fi
-echo "sudo OK."
 
-# --- Run OpenConnect with the script ----------------------------------
-echo "Connecting (Ctrl-C to disconnect)…"
+# --- Run OpenConnect ---------------------------------------------------------
+echo "Connecting..."
 
-# Note: use 'sudo -n' so sudo never tries to prompt while stdin is feeding the VPN password.
-if printf '%s\n' "$PASSWD_WITH_DUO" | sudo -n openconnect \
+{ printf '%s\n' "$PASSWD_WITH_DUO"; cat; } | sudo -n openconnect \
       --protocol=anyconnect \
       --user="$VPN_USER" \
       --authgroup="$VPN_GROUP" \
@@ -264,10 +225,3 @@ if printf '%s\n' "$PASSWD_WITH_DUO" | sudo -n openconnect \
       --no-dtls \
       --script="$INLINE_SCRIPT" \
       "$VPN_SERVER"
-then
-  echo "VPN connection process finished."
-else
-  rc=$?
-  echo "VPN connection failed or was disconnected (exit code: $rc)."
-  exit "$rc"
-fi
