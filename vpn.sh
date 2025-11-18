@@ -3,20 +3,50 @@
 set -Eeuo pipefail
 
 # --- USER CONFIG -------------------------------------------------------------
-VPN_SERVER="server-name"
+VPN_SERVER="tc-vpn-1.vpn.umn.edu"
 VPN_USER="username"
-VPN_GROUP="Group-Name"
+VPN_GROUP="AnyConnect-UofMvpnFull"
 DUO_FACTOR="push"   # push | phone | sms | <6-digit code>
 # -----------------------------------------------------------------------------
 
-need() { command -v "$1" >/dev/null 2>&1 || { echo "ERROR: '$1' not found." >&2; exit 1; }; }
-need openconnect
-need ip
+OS="$(uname -s)"
 
-# --- create a tiny inline "vpnc-script" that OpenConnect will call ------------
-mk_inline_vpnc_script() {
-  local s; s="$(mktemp -p /tmp umn_vpnc.XXXXXX.sh)"
-  cat >"$s" <<'EOS'
+need() { command -v "$1" >/dev/null 2>&1 || { echo "ERROR: '$1' not found." >&2; exit 1; }; }
+
+# Check dependencies based on OS
+need openconnect
+if [ "$OS" = "Linux" ]; then
+  need ip
+fi
+
+# --- Determine which vpnc-script to use --------------------------------------
+get_vpnc_script() {
+  if [ "$OS" = "Darwin" ]; then
+    # --- MACOS DETECTED ---
+    # On macOS, we use the standard vpnc-script installed by Homebrew/MacPorts.
+    # The custom Linux logic (ip route) will not work here.
+    local mac_paths=(
+      "/opt/homebrew/etc/vpnc-script"
+      "/usr/local/etc/vpnc-script"
+      "/etc/vpnc/vpnc-script"
+    )
+
+    for path in "${mac_paths[@]}"; do
+      if [ -x "$path" ]; then
+        echo "$path"
+        return 0
+      fi
+    done
+
+    echo "ERROR: standard 'vpnc-script' not found." >&2
+    echo "       If you installed via Homebrew, run: brew install vpnc-scripts" >&2
+    exit 1
+
+  else
+    # --- LINUX DETECTED ---
+    # Use the custom inline script provided in the original code
+    local s; s="$(mktemp -p /tmp umn_vpnc.XXXXXX.sh)"
+    cat >"$s" <<'EOS'
 #!/usr/bin/env bash
 
 set -Eeuo pipefail
@@ -182,12 +212,21 @@ case "${reason:-}" in
 esac
 exit 0
 EOS
-  chmod +x "$s"
-  echo "$s"
+    chmod +x "$s"
+    echo "$s"
+  fi
 }
 
-INLINE_SCRIPT=""
-cleanup() { [ -n "${INLINE_SCRIPT:-}" ] && rm -f "$INLINE_SCRIPT"; }
+# Get the script path (either generated temp file or system path)
+INLINE_SCRIPT="$(get_vpnc_script)"
+
+# Only delete the script on exit if we are on Linux (where we created a temp file)
+cleanup() { 
+  if [ "$OS" = "Linux" ] && [ -n "${INLINE_SCRIPT:-}" ]; then 
+    rm -f "$INLINE_SCRIPT"
+  fi 
+}
+trap cleanup EXIT
 
 # --- TTY-robust prompts (avoid hangs) ----------------------------------------
 # Always read secrets from the terminal device to guarantee a visible prompt.
@@ -195,7 +234,7 @@ if [ ! -t 0 ] && [ -r /dev/tty ]; then
   exec </dev/tty
 fi
 
-echo "Attempting to connect to UMN VPN (${VPN_GROUP}) as ${VPN_USER}..."
+echo "Attempting to connect to UMN VPN (${VPN_GROUP}) as ${VPN_USER} on ${OS}..."
 printf "Enter UMN Password (ONLY the password; Duo factor '%s' will be appended): " "$DUO_FACTOR"
 IFS= read -r -s UMN_PASSWORD
 echo
@@ -212,11 +251,9 @@ if ! sudo -nv true 2>/dev/null; then
 fi
 echo "sudo OK."
 
-# --- Run OpenConnect with the inline script ----------------------------------
-INLINE_SCRIPT="$(mk_inline_vpnc_script)"
-trap cleanup EXIT
-
+# --- Run OpenConnect with the script ----------------------------------
 echo "Connecting (Ctrl-C to disconnect)…"
+
 # Note: use 'sudo -n' so sudo never tries to prompt while stdin is feeding the VPN password.
 if printf '%s\n' "$PASSWD_WITH_DUO" | sudo -n openconnect \
       --protocol=anyconnect \
